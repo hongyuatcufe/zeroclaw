@@ -52,11 +52,15 @@ impl HttpRequestTool {
 
         let host = extract_host(url)?;
 
-        if is_private_or_local_host(&host) {
+        // Local/private hosts are blocked by default to prevent SSRF attacks.
+        // Exception: if the allowlist explicitly includes the host (e.g. "localhost",
+        // "127.0.0.1"), the operator has opted in and we allow it.
+        let explicitly_allowed = host_matches_allowlist(&host, &self.allowed_domains);
+        if is_private_or_local_host(&host) && !explicitly_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
+        if !explicitly_allowed {
             anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
         }
 
