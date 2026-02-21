@@ -269,6 +269,7 @@ pub struct AppState {
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
     pub auto_save: bool,
+    pub tools_registry: Arc<Vec<Box<dyn tools::Tool>>>,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
@@ -343,7 +344,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -512,6 +513,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         temperature,
         mem,
         auto_save: config.memory.auto_save,
+        tools_registry,
         webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
@@ -525,6 +527,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     };
 
     // Build router with middleware
+    // Use message_timeout_secs from config for agent webhook (long-running multi-agent chains)
+    let webhook_timeout_secs = config.channels_config.message_timeout_secs;
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -537,7 +541,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(webhook_timeout_secs),
         ));
 
     // Run the server
@@ -691,25 +695,45 @@ async fn run_gateway_chat_with_multimodal(
         crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
             &state.model,
-            &[], // tools - empty for simple chat
+            &[], // skills (tool instructions injected by run_tool_call_loop)
             &[], // skills
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
         )
     };
 
-    let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
-    messages.extend(user_messages);
-
     let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared =
-        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
+    let max_tool_iterations = state.config.lock().agent.max_tool_iterations;
 
-    state
-        .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
-        .await
+    tracing::info!(
+        tools_count = state.tools_registry.len(),
+        max_tool_iterations,
+        supports_native_tools = state.provider.supports_native_tools(),
+        "webhook: entering run_tool_call_loop"
+    );
+
+    let mut history = vec![
+        ChatMessage::system(system_prompt),
+        ChatMessage::user(message),
+    ];
+
+    crate::agent::loop_::run_tool_call_loop(
+        state.provider.as_ref(),
+        &mut history,
+        state.tools_registry.as_ref(),
+        state.observer.as_ref(),
+        provider_label,
+        &state.model,
+        state.temperature,
+        false,
+        None,
+        "webhook",
+        &multimodal_config,
+        max_tool_iterations,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Webhook request body
