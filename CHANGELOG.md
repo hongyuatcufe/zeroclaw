@@ -26,12 +26,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `enc:` prefix for encrypted secrets — Use `enc2:` (ChaCha20-Poly1305) instead.
   Legacy values are still decrypted for backward compatibility but should be migrated.
 
+### Added
+- **Agentic delegate mode** (cherry-picked from zeroclaw-labs PR #1085): `DelegateTool` now
+  supports `agentic = true` in `[agents.<name>]` config, which runs a full multi-turn
+  `run_tool_call_loop` inside the sub-agent instead of a single prompt→response. New config
+  fields: `agentic: bool` (default `false`), `allowed_tools: Vec<String>` (tool allowlist for
+  the sub-agent), `max_iterations: usize` (default `10`). The `delegate` tool is always
+  excluded from the sub-agent's tool set to prevent re-entrant delegation. See
+  `docs/multi-agent-http-swarm.md` for a worked example.
+
 ### Fixed
 - **Onboarding channel menu dispatch** now uses an enum-backed selector instead of hard-coded
   numeric match arms, preventing duplicated pattern arms and related `unreachable pattern`
   compiler warnings in `src/onboard/wizard.rs`.
 - **OpenAI native tool spec parsing** now uses owned serializable/deserializable structs,
   fixing a compile-time type mismatch when validating tool schemas before API calls.
+- **Webhook handler now executes tool call loop** (`gateway/mod.rs`): the `/webhook` endpoint
+  previously performed a single chat completion and returned the raw LLM response, so any
+  tool-use blocks were never executed. The handler now calls `run_tool_call_loop`, which
+  iterates: call LLM → execute tool calls → feed results back as tool messages → repeat until
+  the LLM produces a final text response. `AppState` gains a `tools_registry` field so the
+  webhook handler has access to the registered tool set at runtime.
+- **`ReliableProvider` now forwards tool specs to the underlying provider** (`providers/reliable.rs`):
+  the wrapper had no `chat()` override, so the default trait implementation fell through to
+  `chat_with_history()`, which has no `tools` parameter. Tool specifications were silently
+  dropped before reaching the LLM. A `chat()` override was added that passes the full
+  `ChatRequest` — including the `tools` array — unchanged to the inner provider.
+- **`http_request` SSRF guard now honours `allowed_domains` for loopback addresses**
+  (`tools/http_request.rs`): the guard previously blocked all requests to `localhost`,
+  `127.0.0.1`, and `::1` unconditionally, making agent-to-agent HTTP calls impossible in
+  multi-workspace swarm setups. The fix checks `allowed_domains` first; if the target host is
+  explicitly listed, the SSRF block is skipped. Callers that need loopback access must opt in
+  via config: `[http_request] enabled = true; allowed_domains = ["localhost", "127.0.0.1", "::1"]`.
+- **Gateway axum timeout now uses `message_timeout_secs` from config** (`gateway/mod.rs`):
+  the axum `TimeoutLayer` previously applied a hardcoded 30-second limit to all requests.
+  Multi-agent chains — where the Manager calls sub-agents, waits for their tool loops, and
+  synthesises the results — routinely exceed 30 seconds and were silently killed mid-flight.
+  The timeout now reads `channels_config.message_timeout_secs` (default `300`) from the loaded
+  config and passes it to the timeout layer.
 
 ## [0.1.0] - 2026-02-13
 
